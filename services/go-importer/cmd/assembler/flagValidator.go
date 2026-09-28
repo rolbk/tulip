@@ -47,7 +47,8 @@ func (validator *FaustFlagValidator) IsValid(flag string, refTime time.Time) boo
 		data[x] = data[x] ^ validator.xorString[x]
 	}
 
-	flagTime := time.UnixMilli(int64(binary.BigEndian.Uint64(data[:8])))
+	// ctf-gameserver packs the expiration time in seconds
+	flagTime := time.Unix(int64(binary.BigEndian.Uint64(data[:8])), 0)
 	// flagId := int(binary.BigEndian.Uint32(data[8:12]))
 	teamNet := int(binary.BigEndian.Uint16(data[12:14]))
 

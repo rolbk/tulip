@@ -3,6 +3,7 @@ package main
 import (
 	"go-importer/internal/pkg/db"
 
+	"bytes"
 	"log"
 	"regexp"
 
@@ -31,9 +32,57 @@ func contains(s []string, e string) bool {
 	return false
 }
 
+// How many times the data of a flow item is percent-decoded when looking for flags.
+// Two passes also catch double encoded flags ("%253D" -> "%3D" -> "=").
+const flagUrlDecodePasses = 2
+
+func unhex(c byte) (byte, bool) {
+	switch {
+	case '0' <= c && c <= '9':
+		return c - '0', true
+	case 'a' <= c && c <= 'f':
+		return c - 'a' + 10, true
+	case 'A' <= c && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// Leniently percent-decode data (e.g. "%3D" -> "=").
+// Unlike url.QueryUnescape, invalid escapes (e.g. "100%" or "%zz") don't fail
+// the whole buffer, they are just copied as is.
+// "+" is intentionally not decoded to a space, as it is a valid (base64) flag
+// character that is often sent unencoded.
+// Returns nil if data does not contain any valid escape.
+func percentDecode(data []byte) []byte {
+	var decoded []byte
+	start := 0
+	for i := bytes.IndexByte(data, '%'); i >= 0 && i+2 < len(data); i++ {
+		if data[i] != '%' {
+			continue
+		}
+		hi, okHi := unhex(data[i+1])
+		lo, okLo := unhex(data[i+2])
+		if !okHi || !okLo {
+			continue
+		}
+		if decoded == nil {
+			decoded = make([]byte, 0, len(data))
+		}
+		decoded = append(decoded, data[start:i]...)
+		decoded = append(decoded, hi<<4|lo)
+		start = i + 3
+		i += 2
+	}
+	if decoded == nil {
+		return nil
+	}
+	return append(decoded, data[start:]...)
+}
+
 // Apply flag in/flag out tags to the entire flow.
 // This assumes the `Data` part of the flowItem is already pre-processed, s.t.
-// we can run regex tags over the payload directly
+// we can run regex tags over the payload directly (after percent-decoding it)
 // also add the matched flags to the FlowItem
 func ApplyFlagTags(flow *db.FlowEntry, reg *string, flagValidator FlagValidator) {
 	EnsureRegex(reg)
@@ -47,7 +96,16 @@ func ApplyFlagTags(flow *db.FlowEntry, reg *string, flagValidator FlagValidator)
 	flagsOut := 0
 	for idx := 0; idx < len(flow.Flow); idx++ {
 		flowItem := &flow.Flow[idx]
-		matches := flagRegex.FindAll(flowItem.Data, -1)
+		// Flags are often sent URL-encoded, so match against the decoded data
+		data := flowItem.Data
+		for pass := 0; pass < flagUrlDecodePasses; pass++ {
+			decoded := percentDecode(data)
+			if decoded == nil {
+				break
+			}
+			data = decoded
+		}
+		matches := flagRegex.FindAll(data, -1)
 
 		if len(matches) > 0 {
 			var tags []string
@@ -65,6 +123,10 @@ func ApplyFlagTags(flow *db.FlowEntry, reg *string, flagValidator FlagValidator)
 
 			hasFakeFlag := false
 			for _, match := range matches {
+				// Postgres jsonb cannot store \u0000, one such flag would fail the whole COPY batch of flows
+				if bytes.IndexByte(match, 0) >= 0 {
+					continue
+				}
 				flag := string(match)
 				// Add the flag if it doesn't already exist
 				if !contains(flow.Flags, flag) {
